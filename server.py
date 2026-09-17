@@ -1,339 +1,67 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-import requests
-from bs4 import BeautifulSoup
-import re
-import time
+import requests,time
 
+app=FastAPI(title="Crypto.com Signal Bot V1")
+API="https://api.crypto.com/exchange/v1"
+DURATIONS=["1m","2m","3m","5m","10m","15m","30m","1h","2h","3h"]
+cache={}
 
-# =========================================================
-# XTrend Speed Signal Bot
-# AUTO TRADE: OFF
-# =========================================================
+app.mount("/static",StaticFiles(directory="app/static"),name="static")
 
-app = FastAPI(
-    title="XTrend Speed Signal Bot",
-    version="3.0"
-)
+def get_candles(symbol,tf="1m",count=220):
+    r=requests.get(API+"/public/get-candlestick",params={"instrument_name":symbol,"timeframe":tf,"count":count},timeout=12)
+    r.raise_for_status(); j=r.json()
+    if j.get("code")!=0: raise RuntimeError(j.get("message","Crypto.com API error"))
+    d=j["result"]["data"]; d.sort(key=lambda x:x["t"]); return d
 
+def ema(v,p):
+    if len(v)<p:return None
+    k=2/(p+1); x=sum(v[:p])/p
+    for n in v[p:]: x=n*k+x*(1-k)
+    return x
 
-# =========================================================
-# SETTINGS
-# =========================================================
+def rsi(v,p=14):
+    if len(v)<p+1:return None
+    ds=[b-a for a,b in zip(v[-p-1:-1],v[-p:])]
+    g=sum(max(x,0) for x in ds)/p; l=sum(max(-x,0) for x in ds)/p
+    return 100 if l==0 else 100-100/(1+g/l)
 
-XTrend_URL = "https://www.xtrendspeed.com/en-US/signal"
-
-REFRESH_SECONDS = 30
-
-
-# =========================================================
-# STATIC FILES
-# =========================================================
-
-app.mount(
-    "/static",
-    StaticFiles(directory="app/static"),
-    name="static"
-)
-
-
-# =========================================================
-# CACHE
-# =========================================================
-
-cache = {
-    "signals": [],
-    "updated_at": 0,
-    "error": None
-}
-
-
-# =========================================================
-# HTTP HEADERS
-# =========================================================
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) "
-        "Version/18.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-
-# =========================================================
-# SUPPORTED SYMBOLS
-# =========================================================
-
-SYMBOLS = [
-    "AUDUSD",
-    "EURUSD",
-    "USDJPY",
-    "GBPUSD",
-    "NZDUSD",
-    "USDCAD",
-    "USDCHF",
-    "AUDJPY",
-    "EURJPY",
-    "GBPJPY",
-    "XAUUSD",
-    "USOIL",
-    "US30",
-    "NAS100",
-    "SPX500",
-]
-
-
-# =========================================================
-# PARSE XTREND PAGE
-# =========================================================
-
-def parse_signals(html: str):
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    signals = []
-
-    # Try table rows first
-    rows = soup.find_all("tr")
-
-    for row in rows:
-
-        cells = [
-            cell.get_text(
-                " ",
-                strip=True
-            )
-            for cell in row.find_all(
-                ["td", "th"]
-            )
-        ]
-
-        if not cells:
-            continue
-
-        row_text = " ".join(cells)
-
-        symbol = None
-
-        for item in SYMBOLS:
-            if item in row_text.upper():
-                symbol = item
-                break
-
-        if not symbol:
-            continue
-
-        # Direction
-        direction = None
-
-        if re.search(
-            r"\bBUY\b",
-            row_text,
-            re.IGNORECASE
-        ):
-            direction = "BUY"
-
-        elif re.search(
-            r"\bSELL\b",
-            row_text,
-            re.IGNORECASE
-        ):
-            direction = "SELL"
-
-        if not direction:
-            continue
-
-        # Strength
-        if re.search(
-            r"\bSTRONG\b",
-            row_text,
-            re.IGNORECASE
-        ):
-            strength = "STRONG"
-        else:
-            strength = "GENERAL"
-
-        # Update time
-        time_match = re.search(
-            r"\b\d{1,2}:\d{2}\b",
-            row_text
-        )
-
-        update_time = (
-            time_match.group(0)
-            if time_match
-            else ""
-        )
-
-        signals.append({
-            "symbol": symbol,
-            "direction": direction,
-            "strength": strength,
-            "update_time": update_time
-        })
-
-    return signals
-
-
-# =========================================================
-# DOWNLOAD XTREND DATA
-# =========================================================
-
-def fetch_signals():
-
-    try:
-
-        response = requests.get(
-            XTrend_URL,
-            headers=HEADERS,
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        signals = parse_signals(
-            response.text
-        )
-
-        if not signals:
-
-            return [], (
-                "XTrend page loaded, "
-                "but no signals could be parsed."
-            )
-
-        return signals, None
-
-    except requests.HTTPError as error:
-
-        return [], (
-            f"XTrend server returned "
-            f"HTTP {error.response.status_code}."
-        )
-
-    except requests.RequestException as error:
-
-        return [], (
-            f"Connection error: {error}"
-        )
-
-    except Exception as error:
-
-        return [], (
-            f"Unexpected error: {error}"
-        )
-
-
-# =========================================================
-# HOME PAGE
-# =========================================================
+def analyze(symbol,duration):
+    rows=get_candles(symbol); c=[float(x["c"]) for x in rows]
+    e50,e200=ema(c,50),ema(c,200); rr=rsi(c)
+    if e50 is None or e200 is None or rr is None: raise RuntimeError("Not enough candle data")
+    mom=(c[-1]/c[-6]-1)*100
+    buy=sell=50.0; rb=[]; rs=[]
+    if e50>e200: buy+=18; sell-=18; rb.append("EMA50 > EMA200")
+    else: sell+=18; buy-=18; rs.append("EMA50 < EMA200")
+    if rr>=55: buy+=12; rb.append(f"RSI14 {rr:.1f}")
+    elif rr<=45: sell+=12; rs.append(f"RSI14 {rr:.1f}")
+    if mom>0: buy+=min(10,abs(mom)*250); rb.append("positive momentum")
+    elif mom<0: sell+=min(10,abs(mom)*250); rs.append("negative momentum")
+    recent=c[-30:]; price=c[-1]
+    if price<=min(recent)*1.003: buy+=8; rb.append("near support")
+    if price>=max(recent)*.997: sell+=8; rs.append("near resistance")
+    direction="BUY" if buy>=sell else "SELL"
+    return {"symbol":symbol,"direction":direction,"confidence":round(max(buy,sell),1),"duration":duration,
+            "price":price,"ema50":e50,"ema200":e200,"rsi14":rr,"momentum_pct":mom,
+            "reason":" + ".join(rb if direction=="BUY" else rs) or "technical conditions",
+            "updated_at":time.time(),"auto_trade":False}
 
 @app.get("/")
-def home():
-
-    return FileResponse(
-        "app/static/index.html"
-    )
-
-
-# =========================================================
-# MANIFEST
-# =========================================================
-
-@app.get("/manifest.webmanifest")
-def manifest():
-
-    return FileResponse(
-        "app/static/manifest.webmanifest",
-        media_type="application/manifest+json"
-    )
-
-
-# =========================================================
-# SERVICE WORKER
-# =========================================================
-
-@app.get("/sw.js")
-def service_worker():
-
-    return FileResponse(
-        "app/static/sw.js",
-        media_type="application/javascript"
-    )
-
-
-# =========================================================
-# SIGNAL API
-# =========================================================
-
-@app.get("/api/signals")
-def get_signals():
-
-    current_time = time.time()
-
-    needs_refresh = (
-        current_time - cache["updated_at"]
-        >= REFRESH_SECONDS
-        or not cache["signals"]
-    )
-
-    if needs_refresh:
-
-        signals, error = fetch_signals()
-
-        if signals:
-
-            cache["signals"] = signals
-            cache["updated_at"] = current_time
-            cache["error"] = None
-
-        else:
-
-            cache["error"] = error
-
-    # Live data available
-    if cache["signals"]:
-
-        return {
-            "ok": True,
-            "auto_trade": False,
-            "source": XTrend_URL,
-            "updated_at": cache["updated_at"],
-            "signals": cache["signals"]
-        }
-
-    # Live data unavailable
-    return {
-        "ok": False,
-        "auto_trade": False,
-        "source": XTrend_URL,
-        "updated_at": cache["updated_at"],
-        "error": cache["error"],
-        "signals": []
-    }
-
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
+def home(): return FileResponse("app/static/index.html")
 
 @app.get("/health")
-def health():
+def health(): return {"status":"online","bot":"Crypto.com Signal Bot V1","auto_trade":False}
 
-    return {
-        "status": "online",
-        "bot": "XTrend Speed Signal Bot",
-        "auto_trade": False
-    }
+@app.get("/api/signal")
+def signal(symbol="BTC_USDT",duration="15m"):
+    if duration not in DURATIONS: duration="15m"
+    key=symbol.upper()+":"+duration; now=time.time()
+    if key not in cache or now-cache[key]["updated_at"]>20:
+        try: cache[key]=analyze(symbol.upper(),duration)
+        except Exception as e:
+            if key in cache: return {"ok":True,"stale":True,**cache[key],"error":str(e)}
+            return {"ok":False,"error":str(e),"symbol":symbol,"duration":duration,"auto_trade":False}
+    return {"ok":True,**cache[key]}
