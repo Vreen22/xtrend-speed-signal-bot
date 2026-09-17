@@ -2,102 +2,90 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import requests
+from bs4 import BeautifulSoup
 import re
 import time
-from bs4 import BeautifulSoup
 
 app = FastAPI(title="XTrend Speed Signal Bot")
 
+# Static files
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
-# XTrend signal sources
-URLS = [
-    "https://speedwwwtest.xtrendspeed.com/en-US/signal",
+XTREND_URLS = [
     "https://www.xtrendspeed.com/en-US/signal",
     "https://www.xtrendspeed.com/fr-FR/signal",
 ]
 
 cache = {
-    "ts": 0,
-    "signals": []
+    "signals": [],
+    "updated_at": 0,
+    "error": None
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
-def scrape_url(url):
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.xtrendspeed.com/",
-        "Connection": "keep-alive",
-    }
-
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=20,
-        allow_redirects=True
-    )
-
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
+def parse_signals(html: str):
+    soup = BeautifulSoup(html, "html.parser")
 
     text = soup.get_text(" ", strip=True)
+
+    symbols = [
+        "AUDUSD",
+        "EURUSD",
+        "USDJPY",
+        "GBPUSD",
+        "NZDUSD",
+        "USDCAD",
+        "USDCHF",
+        "AUDJPY",
+        "EURJPY",
+        "GBPJPY",
+        "XAUUSD",
+        "USOIL",
+        "US30",
+        "NAS100",
+        "SPX500",
+    ]
 
     signals = []
     seen = set()
 
-    # XTrend symbols such as AUDUSD, EURUSD, USDJPY
-    symbols = re.findall(r"\b[A-Z]{6}\b", text)
-
     for symbol in symbols:
-
         if symbol in seen:
             continue
 
         position = text.find(symbol)
 
-        if position < 0:
+        if position == -1:
             continue
 
         section = text[position:position + 250]
 
-        # Direction
-        if re.search(r"\bBuy\b", section, re.IGNORECASE):
+        buy_match = re.search(r"\bBuy\b", section, re.I)
+        sell_match = re.search(r"\bSell\b", section, re.I)
+
+        if buy_match:
             direction = "BUY"
-
-        elif re.search(r"\bSell\b", section, re.IGNORECASE):
+        elif sell_match:
             direction = "SELL"
-
         else:
             continue
 
-        # Strength
-        if re.search(r"\bStrong\b", section, re.IGNORECASE):
+        if re.search(r"\bStrong\b", section, re.I):
             strength = "STRONG"
         else:
             strength = "GENERAL"
 
-        # Update time
-        time_match = re.search(
-            r"\b\d{1,2}:\d{2}\b",
-            section
-        )
+        time_match = re.search(r"\b\d{1,2}:\d{2}\b", section)
 
-        update_time = (
-            time_match.group(0)
-            if time_match
-            else ""
-        )
+        update_time = ""
+        if time_match:
+            update_time = time_match.group(0)
 
         signals.append({
             "symbol": symbol,
@@ -111,42 +99,43 @@ def scrape_url(url):
     return signals
 
 
-def scrape():
-
+def fetch_signals():
     errors = []
 
-    for url in URLS:
-
+    for url in XTREND_URLS:
         try:
-
-            data = scrape_url(url)
-
-            if data:
-                return data
-
-        except Exception as error:
-
-            errors.append(
-                f"{url} -> {error}"
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=15
             )
 
-    raise Exception(
-        "All XTrend sources failed: "
-        + " | ".join(errors)
-    )
+            response.raise_for_status()
+
+            signals = parse_signals(response.text)
+
+            if signals:
+                return signals, None
+
+            errors.append(
+                f"{url}: page loaded but no signals were parsed"
+            )
+
+        except Exception as e:
+            errors.append(
+                f"{url}: {str(e)}"
+            )
+
+    return [], " | ".join(errors)
 
 
 @app.get("/")
 def home():
-
-    return FileResponse(
-        "app/static/index.html"
-    )
+    return FileResponse("app/static/index.html")
 
 
 @app.get("/manifest.webmanifest")
 def manifest():
-
     return FileResponse(
         "app/static/manifest.webmanifest",
         media_type="application/manifest+json"
@@ -155,7 +144,6 @@ def manifest():
 
 @app.get("/sw.js")
 def service_worker():
-
     return FileResponse(
         "app/static/sw.js",
         media_type="application/javascript"
@@ -165,33 +153,34 @@ def service_worker():
 @app.get("/api/signals")
 def signals():
 
+    now = time.time()
+
     # Refresh every 30 seconds
     if (
-        time.time() - cache["ts"] > 30
+        now - cache["updated_at"] > 30
         or not cache["signals"]
     ):
+        new_signals, error = fetch_signals()
 
-        try:
+        if new_signals:
+            cache["signals"] = new_signals
+            cache["updated_at"] = now
+            cache["error"] = None
+        else:
+            cache["error"] = error
 
-            data = scrape()
-
-            if data:
-
-                cache["signals"] = data
-                cache["ts"] = time.time()
-
-        except Exception as error:
-
-            return {
-                "ok": False,
-                "source": URLS[0],
-                "error": str(error),
-                "signals": cache["signals"]
-            }
+    if cache["signals"]:
+        return {
+            "ok": True,
+            "source": XTREND_URLS[0],
+            "updated_at": cache["updated_at"],
+            "signals": cache["signals"]
+        }
 
     return {
-        "ok": True,
-        "source": URLS[0],
-        "updated_at": cache["ts"],
-        "signals": cache["signals"]
+        "ok": False,
+        "source": XTREND_URLS[0],
+        "updated_at": cache["updated_at"],
+        "error": cache["error"],
+        "signals": []
     }
